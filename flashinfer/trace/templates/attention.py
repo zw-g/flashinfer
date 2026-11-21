@@ -113,7 +113,9 @@ def _attention_check(
 
 
 @torch.no_grad()
-def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale):
+def _gqa_paged_decode_reference(
+    q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+):
     batch_size, num_qo_heads, head_dim = q.shape
     _, page_size, num_kv_heads, _ = k_cache.shape
 
@@ -135,10 +137,13 @@ def _gqa_paged_decode_reference(q, k_cache, v_cache, kv_indptr, kv_indices, sm_s
             output[b].zero_()
             continue
         # kv_indices are page IDs. Gather pages first, then flatten the
-        # [num_selected_pages, page_size] axis into a single token axis.
+        # [num_selected_pages, page_size] axis into a single token axis and
+        # drop the unused tail of the last page.
         page_ids = kv_indices[page_start:page_end].to(torch.long)
-        k_b = k_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
-        v_b = v_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
+        last_page_len = int(kv_last_page_len[b].item())
+        num_kv_tokens = (page_end - page_start - 1) * page_size + last_page_len
+        k_b = k_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)[:num_kv_tokens]
+        v_b = v_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)[:num_kv_tokens]
         q_b = q[b].to(torch.float32)  # [num_qo_heads, head_dim]
         for h in range(num_qo_heads):
             kv_h = h // gqa_ratio
@@ -252,6 +257,11 @@ gqa_paged_decode_trace = TraceTemplate(
             ["num_kv_indices"],
             optional=True,
             description="Page IDs for KV cache lookups. Set during plan(), not run().",
+        ),
+        "kv_last_page_len": Tensor(
+            ["batch_size"],
+            optional=True,
+            description="Number of valid tokens in the last page of each sequence. Set during plan(), not run().",
         ),
         "sm_scale": Scalar(
             "float32",
@@ -2314,7 +2324,7 @@ prims_ts_decode_mla_wrapper_trace_dispatch.templates = _prims_ts_scale_trace_tem
 
 @torch.no_grad()
 def _gqa_paged_prefill_reference(
-    q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, sm_scale
+    q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len, sm_scale
 ):
     total_q, num_qo_heads, head_dim = q.shape
     num_pages, page_size, num_kv_heads, _ = k_cache.shape
@@ -2343,7 +2353,8 @@ def _gqa_paged_prefill_reference(
         page_ids = kv_indices[kv_start:kv_end].to(torch.long)
         k_b = k_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
         v_b = v_cache_f32[page_ids].reshape(-1, num_kv_heads, head_dim)
-        num_kv_tokens = k_b.shape[0]
+        last_page_len = int(kv_last_page_len[b].item())
+        num_kv_tokens = (kv_end - kv_start - 1) * page_size + last_page_len
         q_b = q_f32[q_start:q_end]
         delta = num_kv_tokens - q_b.shape[0]
         for q_idx in range(q_b.shape[0]):
@@ -2450,6 +2461,7 @@ gqa_paged_prefill_trace = TraceTemplate(
         "total_q": Var(description="Total number of query tokens."),
         "num_kv_indices": Var(description="Total number of KV page indices."),
         "num_pages": Var(),
+        "batch_size": Var(description="Number of sequences in the batch."),
     },
     inputs={
         "q": Tensor(["total_q", "num_qo_heads", "head_dim"]),
@@ -2478,6 +2490,11 @@ gqa_paged_prefill_trace = TraceTemplate(
             optional=True,
             description="Page IDs for KV cache lookups. Set during plan(), not run().",
         ),
+        "kv_last_page_len": Tensor(
+            ["batch_size"],
+            optional=True,
+            description="Number of valid tokens in the last page of each sequence. Set during plan(), not run().",
+        ),
         "sm_scale": Scalar(
             "float32",
             optional=True,
@@ -2499,6 +2516,7 @@ gqa_paged_prefill_trace = TraceTemplate(
     constraints=[
         "total_q == qo_indptr[-1].item()",
         "num_kv_indices == kv_indptr[-1].item()",
+        "len_indptr == batch_size + 1",
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_gqa_paged_prefill_reference,

@@ -181,8 +181,15 @@ def test_stateful_plan_run_namespace_and_candidate_kwargs():
     self_obj = _W()
     kv_indptr = torch.zeros(2, dtype=torch.int32)
     kv_indices = torch.zeros(3, dtype=torch.int32)
+    last_page_len = torch.ones(1, dtype=torch.int32)
     stash_plan_kwargs(
-        self_obj, {"indptr": kv_indptr, "indices": kv_indices, "sm_scale": 0.125}
+        self_obj,
+        {
+            "indptr": kv_indptr,
+            "indices": kv_indices,
+            "last_page_len": last_page_len,
+            "sm_scale": 0.125,
+        },
     )
 
     q = torch.empty(1, 32, 128)
@@ -206,7 +213,62 @@ def test_stateful_plan_run_namespace_and_candidate_kwargs():
     assert ck["q"] is q
     assert ck["k_cache"] is k_cache and ck["v_cache"] is v_cache
     assert ck["kv_indptr"] is kv_indptr and ck["kv_indices"] is kv_indices
+    assert ck["kv_last_page_len"] is last_page_len
     assert ck["sm_scale"] == 0.125
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "fi_api,stashed,names",
+    [
+        # Prefill: the kwargs stashed by the wrapped public plan().
+        (
+            "flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper.run",
+            True,
+            {
+                "qo_indptr": "qo_indptr",
+                "kv_indptr": "paged_kv_indptr",
+                "kv_indices": "paged_kv_indices",
+                "kv_last_page_len": "paged_kv_last_page_len",
+            },
+        ),
+        # Decode: the wrapper's buffers alone, as a fast-path planner leaves them.
+        (
+            "flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.run",
+            False,
+            {
+                "kv_indptr": "_paged_kv_indptr_buf",
+                "kv_indices": "_paged_kv_indices_buf",
+                "kv_last_page_len": "_paged_kv_last_page_len_buf",
+            },
+        ),
+    ],
+    ids=["prefill_plan_kwargs", "decode_wrapper_buffers"],
+)
+def test_stateful_paged_kv_adapters_recover_plan_state(fi_api, stashed, names):
+    from flashinfer.trace_apply.plan_capture import adapter_for, stash_plan_kwargs
+
+    run_original, templates = _registry_by_fi_api()[fi_api]
+    build_ns = _stateful_namespace_builder(
+        run_original, templates[0], adapter_for(fi_api)
+    )
+
+    class _W:
+        pass
+
+    self_obj = _W()
+    expected = {key: torch.zeros(1, dtype=torch.int32) for key in names}
+    state = {names[key]: value for key, value in expected.items()}
+    if stashed:
+        stash_plan_kwargs(self_obj, state)
+    else:
+        vars(self_obj).update(state)
+    kv_cache = torch.empty(3, 16, 8, 128)
+    ns = build_ns((self_obj, torch.empty(4, 32, 128), (kv_cache, kv_cache)), {})
+
+    ck = adapt.build_candidate_kwargs(templates[0], ns)
+    for key, value in expected.items():
+        assert ck[key] is value, key
 
 
 @pytest.mark.cpu_only
