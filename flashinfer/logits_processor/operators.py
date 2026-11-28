@@ -65,6 +65,9 @@ class TemperatureOp(ParameterizedOp):
 
         if maybe_temperature_arr is not None:
             temperature = maybe_temperature_arr
+            # One value per row: divide rows, not vocab columns.
+            if temperature.shape == tensor.data.shape[:-1]:
+                temperature = temperature.unsqueeze(-1)
         else:
             temperature = temperature_val
 
